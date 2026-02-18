@@ -5100,6 +5100,26 @@ impl Workspace {
         self.update_window_title(window, cx);
     }
 
+    /// Returns the display name for this workspace based on its worktree names.
+    pub fn display_name(&self, cx: &App) -> SharedString {
+        let project = self.project().read(cx);
+        let mut title = String::new();
+
+        for (i, worktree) in project.visible_worktrees(cx).enumerate() {
+            let name = worktree.read(cx).root_name_str();
+            if i > 0 {
+                title.push_str(", ");
+            }
+            title.push_str(name);
+        }
+
+        if title.is_empty() {
+            SharedString::from("Empty Project")
+        } else {
+            SharedString::from(title)
+        }
+    }
+
     fn update_window_title(&mut self, window: &mut Window, cx: &mut App) {
         let project = self.project().read(cx);
         let mut title = String::new();

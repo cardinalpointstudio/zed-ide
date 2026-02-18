@@ -2,12 +2,15 @@ use anyhow::Result;
 use feature_flags::{AgentV2FeatureFlag, FeatureFlagAppExt};
 use gpui::{
     AnyView, App, Context, DragMoveEvent, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
-    ManagedView, MouseButton, Pixels, Render, Subscription, Task, Tiling, Window, actions,
-    deferred, px,
+    ManagedView, MouseButton, Pixels, Render, SharedString, Subscription, Task, Tiling, Window,
+    actions, deferred, px,
 };
 use project::Project;
 use std::path::PathBuf;
-use ui::prelude::*;
+use ui::{
+    ButtonSize, Color, IconButton, IconButtonShape, IconName, IconSize, Tab, TabBar, TabCloseSide,
+    TabPosition, Tooltip, prelude::*,
+};
 
 const SIDEBAR_RESIZE_HANDLE_SIZE: Pixels = px(6.0);
 
@@ -58,6 +61,22 @@ pub struct DraggedSidebar;
 impl Render for DraggedSidebar {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         gpui::Empty
+    }
+}
+
+#[derive(Clone)]
+pub struct DraggedWorkspaceTab {
+    #[allow(dead_code)]
+    pub workspace: Entity<Workspace>,
+    pub index: usize,
+    pub name: SharedString,
+}
+
+impl Render for DraggedWorkspaceTab {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        Tab::new("dragged_workspace_tab")
+            .toggle_state(true)
+            .child(self.name.clone())
     }
 }
 
@@ -456,6 +475,41 @@ impl MultiWorkspace {
         cx.notify();
     }
 
+    /// Moves a workspace from one index to another, updating active_workspace_index accordingly.
+    pub fn move_workspace(
+        &mut self,
+        from_index: usize,
+        to_index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if from_index == to_index
+            || from_index >= self.workspaces.len()
+            || to_index >= self.workspaces.len()
+        {
+            return;
+        }
+
+        let workspace = self.workspaces.remove(from_index);
+        self.workspaces.insert(to_index, workspace);
+
+        // Update active_workspace_index to track the moved workspace if it was active
+        if self.active_workspace_index == from_index {
+            self.active_workspace_index = to_index;
+        } else if from_index < self.active_workspace_index
+            && to_index >= self.active_workspace_index
+        {
+            self.active_workspace_index -= 1;
+        } else if from_index > self.active_workspace_index
+            && to_index <= self.active_workspace_index
+        {
+            self.active_workspace_index += 1;
+        }
+
+        self.serialize(window, cx);
+        cx.notify();
+    }
+
     pub fn open_project(
         &mut self,
         paths: Vec<PathBuf>,
@@ -487,11 +541,121 @@ impl MultiWorkspace {
             })
         }
     }
+
+    fn render_workspace_tab(
+        &self,
+        workspace: &Entity<Workspace>,
+        index: usize,
+        total_count: usize,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let is_active = index == self.active_workspace_index;
+        let workspace_name = workspace.read(cx).display_name(cx);
+        let workspace_clone = workspace.clone();
+        let weak = cx.weak_entity();
+
+        let position = if index == 0 {
+            TabPosition::First
+        } else if index == total_count - 1 {
+            TabPosition::Last
+        } else {
+            TabPosition::Middle(index.cmp(&self.active_workspace_index))
+        };
+
+        let tab_name = workspace_name.clone();
+        Tab::new(("workspace_tab", index))
+            .position(position)
+            .toggle_state(is_active)
+            .close_side(TabCloseSide::End)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.activate_index(index, window, cx);
+            }))
+            .on_drag(
+                DraggedWorkspaceTab {
+                    workspace: workspace_clone,
+                    index,
+                    name: tab_name,
+                },
+                |tab, _, _, cx| cx.new(|_| tab.clone()),
+            )
+            .drag_over::<DraggedWorkspaceTab>(move |tab, dragged, _, cx| {
+                let styled = tab
+                    .bg(cx.theme().colors().drop_target_background)
+                    .border_color(cx.theme().colors().drop_target_border);
+
+                if index < dragged.index {
+                    styled.border_l_2()
+                } else if index > dragged.index {
+                    styled.border_r_2()
+                } else {
+                    styled
+                }
+            })
+            .on_drop(
+                cx.listener(move |this, dragged: &DraggedWorkspaceTab, window, cx| {
+                    this.move_workspace(dragged.index, index, window, cx);
+                }),
+            )
+            .child(workspace_name)
+            .end_slot::<AnyElement>(if total_count > 1 {
+                Some(
+                    IconButton::new(("close_workspace", index), IconName::Close)
+                        .shape(IconButtonShape::Square)
+                        .icon_color(Color::Muted)
+                        .size(ButtonSize::None)
+                        .icon_size(IconSize::XSmall)
+                        .visible_on_hover("")
+                        .on_click(move |_, window, cx| {
+                            weak.update(cx, |this, cx| {
+                                this.remove_workspace(index, window, cx);
+                            })
+                            .ok();
+                        })
+                        .tooltip(Tooltip::text("Close Project"))
+                        .into_any_element(),
+                )
+            } else {
+                None
+            })
+    }
+
+    fn render_workspace_tab_bar(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let workspace_count = self.workspaces.len();
+        let weak = cx.weak_entity();
+
+        TabBar::new("workspace_tab_bar")
+            .children(
+                self.workspaces
+                    .iter()
+                    .enumerate()
+                    .map(|(index, workspace)| {
+                        self.render_workspace_tab(workspace, index, workspace_count, window, cx)
+                            .into_any_element()
+                    }),
+            )
+            .end_child(
+                IconButton::new("add_workspace", IconName::Plus)
+                    .icon_size(IconSize::Small)
+                    .on_click(move |_, window, cx| {
+                        weak.update(cx, |this, cx| {
+                            this.create_workspace(window, cx);
+                        })
+                        .ok();
+                    })
+                    .tooltip(Tooltip::text("New Project")),
+            )
+    }
 }
 
 impl Render for MultiWorkspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let multi_workspace_enabled = self.multi_workspace_enabled(cx);
+        let show_workspace_tabs = multi_workspace_enabled && self.workspaces.len() > 1;
 
         let sidebar: Option<AnyElement> = if multi_workspace_enabled && self.sidebar_open {
             self.sidebar.as_ref().map(|sidebar_handle| {
@@ -542,8 +706,14 @@ impl Render for MultiWorkspace {
             None
         };
 
+        let workspace_tab_bar: Option<AnyElement> = if show_workspace_tabs {
+            Some(self.render_workspace_tab_bar(window, cx).into_any_element())
+        } else {
+            None
+        };
+
         client_side_decorations(
-            h_flex()
+            v_flex()
                 .key_context("Workspace")
                 .size_full()
                 .on_action(
@@ -571,27 +741,34 @@ impl Render for MultiWorkspace {
                         this.focus_sidebar(window, cx);
                     }),
                 )
-                .when(
-                    self.sidebar_open() && self.multi_workspace_enabled(cx),
-                    |this| {
-                        this.on_drag_move(cx.listener(
-                            |this: &mut Self, e: &DragMoveEvent<DraggedSidebar>, _window, cx| {
-                                if let Some(sidebar) = &this.sidebar {
-                                    let new_width = e.event.position.x;
-                                    sidebar.set_width(Some(new_width), cx);
-                                }
-                            },
-                        ))
-                        .children(sidebar)
-                    },
-                )
+                .children(workspace_tab_bar)
                 .child(
-                    div()
-                        .flex()
+                    h_flex()
                         .flex_1()
                         .size_full()
                         .overflow_hidden()
-                        .child(self.workspace().clone()),
+                        .when(self.sidebar_open() && multi_workspace_enabled, |this| {
+                            this.on_drag_move(cx.listener(
+                                |this: &mut Self,
+                                 e: &DragMoveEvent<DraggedSidebar>,
+                                 _window,
+                                 cx| {
+                                    if let Some(sidebar) = &this.sidebar {
+                                        let new_width = e.event.position.x;
+                                        sidebar.set_width(Some(new_width), cx);
+                                    }
+                                },
+                            ))
+                            .children(sidebar)
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .flex_1()
+                                .size_full()
+                                .overflow_hidden()
+                                .child(self.workspace().clone()),
+                        ),
                 ),
             window,
             cx,
